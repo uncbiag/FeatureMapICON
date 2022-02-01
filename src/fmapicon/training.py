@@ -1,8 +1,18 @@
-
+import platform 
+import pykeops
+import os
 import random
 import footsteps
 from pykeops.torch import LazyTensor
 
+try:
+    cache_path=f"/playpen-raid1/tgreer/keops_cache/{''.join(''.join(platform.node().split('-')).split('.'))}"
+    os.makedirs(cache_path, exist_ok=True)
+    pykeops.set_bin_folder(cache_path)
+    print(f"keops path is {cache_path}")
+except Exception as e:
+    print("setting path failed"  + str(e))
+    print(f"default keops path")
 
 from torch import nn
 import torch
@@ -10,7 +20,21 @@ import torch.nn.functional as F
 import numpy as np
 
 from fmapicon.models import tallerUNet64
+import fmapicon.models as models
 
+def multi_roll_d2(input, offsets):
+    index = torch.arange(0, input.shape[2], dtype=torch.long, device=input.device)
+    index_shifted = (
+        offsets[:, None, None, None] + index[None, None, :, None]
+    ) % 120 + torch.zeros(1, input.shape[1], 1, input.shape[3], dtype=torch.long, device=input.device)
+    return torch.gather(input, 2, index_shifted )
+
+def multi_roll_d3(input, offsets):
+    index = torch.arange(0, input.shape[3], dtype=torch.long, device=input.device)
+    index_shifted = (
+        offsets[:, None, None, None] + index[None, None, None, :]
+    ) % 120 + torch.zeros(1, input.shape[1], input.shape[2], 1, dtype=torch.long, device=input.device)
+    return torch.gather(input, 3, index_shifted)
 
 def warping(net, tensor):
     identity = torch.Tensor([[[1., 0, 0], [0, 1, 0], [0, 0, 1]]]).cuda()
@@ -25,7 +49,14 @@ def warping(net, tensor):
         forward, backward = backward, forward
 
     forward_grid = F.affine_grid(forward[:, :2], tensor[:, :3].shape)
-    
+   
+    #Add some random rolling
+    u_roll = torch.randint(0, 120, (64,), device=tensor.device)
+    v_roll = torch.randint(0, 120, (64,), device=tensor.device)
+
+    #tensor = torch.roll(tensor, (u_roll, v_roll), (2, 3))
+    tensor = multi_roll_d2(tensor, u_roll)
+    tensor = multi_roll_d3(tensor, v_roll)
     
     warped_input = F.grid_sample(tensor, forward_grid)
     
@@ -37,6 +68,10 @@ def warping(net, tensor):
     #magnitudes = .000001 + torch.sqrt(torch.sum(unwarped_output**2, axis=1, keepdims=True))
     #unwarped_output = 12 * unwarped_output / magnitudes
 
+    #unwarped_output = torch.roll(unwarped_output, (-u_roll, -v_roll), (2, 3))
+
+    unwarped_output = multi_roll_d3(unwarped_output, -v_roll)
+    unwarped_output = multi_roll_d2(unwarped_output, -u_roll)
     return unwarped_output
 
     
@@ -73,20 +108,20 @@ class FMAPModelWarping(nn.Module):
         l_feats_a_v = LazyTensor(feats_a_v[:, :, None, :])
         l_feats_b_v = LazyTensor(feats_b_v[:, None, :, :])
 
-        M_unn_h = (l_feats_a_h * l_feats_b_h).sum(3)
-        M_unn_v = (l_feats_a_v * l_feats_b_v).sum(3)
+        M_unnormalized_h = (l_feats_a_h * l_feats_b_h).sum(3)
+        M_unnormalized_v = (l_feats_a_v * l_feats_b_v).sum(3)
         
         with torch.no_grad():
-            vm = M_unn_v.max(1)
-            hm = M_unn_h.max(2)
+            vmax = M_unnormalized_v.max(1)
+            hmax = M_unnormalized_h.max(2)
         
-        M_v = (M_unn_v - vm[:, None]).exp()
+        M_v = (M_unnormalized_v - vmax[:, None]).exp()
         
         #print(M_v.max(1))
         
         
         
-        M_h = (M_unn_h - hm[:, :, None]).exp()
+        M_h = (M_unnormalized_h - hmax[:, :, None]).exp()
         
         
 
@@ -110,14 +145,18 @@ if __name__ == "__main__":
 
     import fmapicon.threaded_video_dataset as threaded_video_dataset
     gen = threaded_video_dataset.threadedProvide()
-    feature_net = tallerUNet2().cuda()
+    feature_net = models.shortUNet64(normalize_pixels=True).cuda()
 
 
-    #feature_net.load_state_dict(torch.load("results/deeeep_warp/network00006.trch"))
+    #stat = torch.load("results/rolling_shortnet_30maxgap/network00121.trch")
+    #feature_net.load_state_dict(stat)
+
     loss_model_2 = FMAPModelWarping(feature_net, 64)
 
-    optimizer = torch.optim.RMSprop(feature_net.parameters(), lr=.0001)
+    optimizer = torch.optim.RMSprop(feature_net.parameters(), lr=.001)
     #optimizer = torch.optim.Adam(feature_net.parameters(), lr=.0001)
+    #optimizer.load_state_dict(torch.load("results/rolling_shortnet_30maxgap/opt00121.trch"))
+
     feature_net.train()
     feature_net.cuda()
     losses = []
@@ -128,7 +167,7 @@ if __name__ == "__main__":
         torch.save(losses, footsteps.output_dir + f"loss{i:05}.trch")
         
         for j in range(100):
-            q = next(gen)[:32] / 255
+            q = next(gen)[:] / 255
             loss = -loss_model_2(q[:, :3], q[:, 3:])
             loss.backward()
             parameters = feature_net.parameters()
